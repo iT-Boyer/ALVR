@@ -1,18 +1,23 @@
 [package]
 name = "alvr_common"
-version = "19.0.0-dev03"
-authors = ["alvr-org", "Riccardo Zaglia <riccardo.zaglia5@gmail.com>"]
-license = "MIT"
-edition = "2021"
-rust-version = "1.58"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
 backtrace = "0.3"
-glam = { version = "0.21", features = ["serde"] }
+glam = { version = "0.29", features = ["serde"] }
 log = "0.4"
 once_cell = "1"
 parking_lot = "0.12"
+paste = "1"
 semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+settings-schema = { git = "https://github.com/alvr-org/settings-schema-rs", rev = "676185f" }
+# settings-schema = { path = "../../../../settings-schema-rs/settings-schema" }
 
-[target.'cfg(windows)'.dependencies]
-msgbox = "0.7"
+[target.'cfg(all(not(target_os = "android"), not(target_os = "ios")))'.dependencies]
+rfd = "0.14"

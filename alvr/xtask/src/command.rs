@@ -10,6 +10,10 @@ pub fn unzip(sh: &Shell, source: &Path, destination: &Path) -> Result<(), xshell
     cmd!(sh, "unzip {source} -d {destination}").run()
 }
 
+pub fn untar(sh: &Shell, source: &Path, destination: &Path) -> Result<(), xshell::Error> {
+    cmd!(sh, "tar -xvf {source} -C {destination}").run()
+}
+
 pub fn targz(sh: &Shell, source: &Path) -> Result<(), xshell::Error> {
     let parent_dir = source.parent().unwrap();
     let file_name = source.file_name().unwrap();
@@ -21,23 +25,24 @@ pub fn download(sh: &Shell, url: &str, destination: &Path) -> Result<(), xshell:
     cmd!(sh, "curl -L -o {destination} --url {url}").run()
 }
 
-pub fn make_symlink(sh: &Shell, file: &Path, symlink_file: &Path) -> Result<(), xshell::Error> {
-    cmd!(sh, "ln -sr {file} {symlink_file}").run()
-}
-
-pub fn download_and_extract_zip(
-    sh: &Shell,
-    url: &str,
-    destination: &Path,
-) -> Result<(), xshell::Error> {
+pub fn download_and_extract_zip(url: &str, destination: &Path) -> Result<(), xshell::Error> {
+    let sh = Shell::new().unwrap();
     let temp_dir_guard = sh.create_temp_dir()?;
 
     let zip_file = temp_dir_guard.path().join("temp_download.zip");
-    download(sh, url, &zip_file)?;
+    download(&sh, url, &zip_file)?;
 
-    sh.remove_path(&destination).ok();
-    sh.create_dir(&destination)?;
-    unzip(sh, &zip_file, destination)
+    unzip(&sh, &zip_file, destination)
+}
+
+pub fn download_and_extract_tar(url: &str, destination: &Path) -> Result<(), xshell::Error> {
+    let sh = Shell::new().unwrap();
+    let temp_dir_guard = sh.create_temp_dir()?;
+
+    let tar_file = temp_dir_guard.path().join("temp_download.tar");
+    download(&sh, url, &tar_file)?;
+
+    untar(&sh, &tar_file, destination)
 }
 
 pub fn date_utc_yyyymmdd(sh: &Shell) -> Result<String, xshell::Error> {

@@ -1,22 +1,24 @@
+#![cfg(target_os = "linux")]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::too_many_arguments)]
+#![allow(unused_imports)]
+
+use std::ffi::CString;
+
 #[allow(
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
-    dead_code
+    dead_code,
+    clippy::useless_transmute
 )]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/layer_bindings.rs"));
 }
 use bindings::*;
 
-use std::ffi::CString;
-use std::os::raw::c_char;
-
 #[no_mangle]
-pub unsafe extern "C" fn vkGetInstanceProcAddr(
-    instance: VkInstance,
-    p_name: *const c_char,
-) -> PFN_vkVoidFunction {
+pub unsafe extern "C" fn ALVR_Negotiate(nli: *mut VkNegotiateLayerInterface) -> VkResult {
     g_sessionPath = CString::new(
         alvr_filesystem::filesystem_layout_invalid()
             .session()
@@ -26,13 +28,5 @@ pub unsafe extern "C" fn vkGetInstanceProcAddr(
     .unwrap()
     .into_raw();
 
-    bindings::wsi_layer_vkGetInstanceProcAddr(instance, p_name)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn vkGetDeviceProcAddr(
-    instance: VkDevice,
-    p_name: *const c_char,
-) -> PFN_vkVoidFunction {
-    bindings::wsi_layer_vkGetDeviceProcAddr(instance, p_name)
+    bindings::wsi_layer_Negotiate(nli)
 }

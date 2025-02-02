@@ -1,11 +1,8 @@
-use alvr_common::prelude::*;
+use alvr_common::{error, info};
 use app_dirs2::{AppDataType, AppInfo};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
-
-pub static LOBBY_ROOM_GLTF: &[u8] = include_bytes!("../resources/loading.gltf");
-pub static LOBBY_ROOM_BIN: &[u8] = include_bytes!("../resources/buffer.bin");
 
 fn config_path() -> PathBuf {
     app_dirs2::app_root(
@@ -21,8 +18,8 @@ fn config_path() -> PathBuf {
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {
-    pub protocol_id: u64,
     pub hostname: String,
+    pub protocol_id: String,
 }
 
 impl Default for Config {
@@ -30,14 +27,14 @@ impl Default for Config {
         let mut rng = rand::thread_rng();
 
         Self {
-            protocol_id: alvr_common::protocol_id(),
             hostname: format!(
-                "{}{}{}{}.client.alvr",
+                "{}{}{}{}.client.local.",
                 rng.gen_range(0..10),
                 rng.gen_range(0..10),
                 rng.gen_range(0..10),
                 rng.gen_range(0..10),
             ),
+            protocol_id: alvr_common::protocol_id(),
         }
     }
 }

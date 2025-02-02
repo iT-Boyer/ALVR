@@ -12,6 +12,7 @@ Release
 
 # editor
 .vs/
+.idea/
 
 # NuGet Packages
 *.nupkg
@@ -62,4 +63,13 @@ node_modules
 
 # The .gitignore for android is project folder.
 
-alvr_launcher_mutex
+# flatpak
+.flatpak*
+
+ALVR-Launcher
+
+#allows adding CMake files for some IDEs to parse C++ files correctly
+CMakeLists.txt
+cmake-build-debug/
+
+*.jks

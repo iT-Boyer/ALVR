@@ -1,11 +1,16 @@
 mod build;
+mod ci;
 mod command;
 mod dependencies;
+mod format;
 mod packaging;
 mod version;
 
+use crate::build::Profile;
 use afs::Layout;
 use alvr_filesystem as afs;
+use dependencies::OpenXRLoadersSelection;
+use packaging::ReleaseFlavor;
 use pico_args::Arguments;
 use std::{fs, time::Instant};
 use xshell::{cmd, Shell};
@@ -18,59 +23,66 @@ USAGE:
     cargo xtask <SUBCOMMAND> [FLAG] [ARGS]
 
 SUBCOMMANDS:
-    prepare-deps        Download and compile server and client external dependencies
-    build-server        Build server driver, then copy binaries to build folder
+    prepare-deps        Download and compile streamer and client external dependencies
+    build-streamer      Build streamer, then copy binaries to build folder
+    build-launcher      Build launcher, then copy binaries to build folder
+    build-server-lib    Build a C-ABI ALVR server library and header
     build-client        Build client, then copy binaries to build folder
-    build-client-lib    Build a C-ABI ALVR client library and header.
-    run-server          Build server and then open the launcher
-    package-server      Build server in release mode, make portable version and installer
+    build-client-lib    Build a C-ABI ALVR client library and header
+    build-client-xr-lib Build a C-ABI ALVR OpenXR entry point client library and header
+    run-streamer        Build streamer and then open the dashboard
+    run-launcher        Build launcher and then open it
+    format              Autoformat all code
+    check-format        Check if code is correctly formatted
+    package-streamer    Build streamer with distribution profile, make archive
+    package-launcher    Build launcher with distribution profile, make archive
+    package-client      Build client with distribution profile
     package-client-lib  Build client library then zip it
-    clean               Removes all build artifacts and dependencies.
-    bump                Bump server and client package versions
+    clean               Removes all build artifacts and dependencies
+    bump                Bump streamer and client package versions
     clippy              Show warnings for selected clippy lints
     kill-oculus         Kill all Oculus processes
 
 FLAGS:
     --help              Print this text
+    --keep-config       Preserve the configuration file between rebuilds (session.json)
     --no-nvidia         Disables nVidia support on Linux. For prepare-deps subcommand
-    --release           Optimized build without debug info. For build subcommands
-    --gpl               Bundle GPL libraries. For build subcommands
-    --experiments       Build unfinished features. For build subcommands
+    --release           Optimized build with less debug checks. For build subcommands
+    --profiling         Enable Profiling
+    --gpl               Bundle GPL libraries (FFmpeg). Only for Windows
     --nightly           Append nightly tag to versions. For bump subcommand
-    --no-rebuild        Do not rebuild the server with run-server
+    --no-rebuild        Do not rebuild the streamer with run-streamer
     --ci                Do some CI related tweaks. Depends on the other flags and subcommand
+    --no-stdcpp         Disable linking to libc++_shared with build-client-lib
+    --all-targets       For prepare-deps and build-client-lib subcommand, will build for all android supported ABI targets
+    --meta-store        For package-client subcommand, build for Meta Store
+    --pico-store        For package-client subcommand, build for Pico Store
 
 ARGS:
-    --platform <NAME>   Name of the platform (operative system or hardware name). snake_case
+    --platform <NAME>   Name of the platform (operative system name)
     --version <VERSION> Specify version to set with the bump-versions subcommand
     --root <PATH>       Installation root. By default no root is set and paths are calculated using
                         relative paths, which requires conforming to FHS on Linux.
 "#;
 
-// Crates at "alvr/" level that are prefixed with "alvr_"
-pub fn crate_dir_names() -> Vec<String> {
-    let sh = Shell::new().unwrap();
-
-    // NB: macOS might create a .DS_Store file. Filter to only directories
-    sh.read_dir(afs::workspace_dir().join("alvr"))
-        .unwrap()
-        .into_iter()
-        .filter(|path| path.is_dir())
-        .map(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .as_ref()
-                .to_owned()
-        })
-        .collect()
+enum BuildPlatform {
+    Windows,
+    Linux,
+    Macos,
+    Android,
 }
 
-pub fn run_server() {
+pub fn run_streamer() {
     let sh = Shell::new().unwrap();
 
-    let launcher_exe = Layout::new(&afs::server_build_dir()).launcher_exe();
+    let dashboard_exe = Layout::new(&afs::streamer_build_dir()).dashboard_exe();
+    cmd!(sh, "{dashboard_exe}").run().unwrap();
+}
 
+pub fn run_launcher() {
+    let sh = Shell::new().unwrap();
+
+    let launcher_exe = afs::launcher_build_exe_path();
     cmd!(sh, "{launcher_exe}").run().unwrap();
 }
 
@@ -84,18 +96,12 @@ pub fn clean() {
 }
 
 fn clippy() {
-    let crate_flags = crate_dir_names()
-        .into_iter()
-        .filter(|name| name != "client" && name != "vulkan_layer")
-        .flat_map(|name| ["-p".into(), format!("alvr_{name}")]);
-
     // lints updated for Rust 1.59
     let restriction_lints = [
-        // "allow_attributes_without_reason", // Rust 1.61
+        "allow_attributes_without_reason",
         "clone_on_ref_ptr",
         "create_dir",
         "decimal_literal_representation",
-        "else_if_without_else",
         "expect_used",
         "float_cmp_const",
         "fn_to_numeric_cast_any",
@@ -106,9 +112,9 @@ fn clippy() {
         "mem_forget",
         "multiple_inherent_impl",
         "rest_pat_in_fully_bound_structs",
-        "self_named_module_files",
+        // "self_named_module_files",
         "str_to_string",
-        "string_slice",
+        // "string_slice",
         "string_to_string",
         "try_err",
         "unnecessary_self_imports",
@@ -118,7 +124,7 @@ fn clippy() {
         "wildcard_enum_match_arm",
     ];
     let pedantic_lints = [
-        // "borrow_as_ptr", // Rust 1.60
+        "borrow_as_ptr",
         "enum_glob_use",
         "explicit_deref_methods",
         "explicit_into_iter_loop",
@@ -135,9 +141,7 @@ fn clippy() {
         .flat_map(|name| ["-W".to_owned(), format!("clippy::{name}")]);
 
     let sh = Shell::new().unwrap();
-    cmd!(sh, "cargo clippy {crate_flags...} -- {flags...}")
-        .run()
-        .unwrap();
+    cmd!(sh, "cargo clippy -- {flags...}").run().unwrap();
 }
 
 // Avoid Oculus link popups when debugging the client
@@ -161,51 +165,105 @@ fn main() {
     } else if let Ok(Some(subcommand)) = args.subcommand() {
         let no_nvidia = args.contains("--no-nvidia");
         let is_release = args.contains("--release");
+        let profile = if is_release {
+            Profile::Release
+        } else {
+            Profile::Debug
+        };
+        let profiling = args.contains("--profiling");
         let gpl = args.contains("--gpl");
-        let experiments = args.contains("--experiments");
         let is_nightly = args.contains("--nightly");
         let no_rebuild = args.contains("--no-rebuild");
         let for_ci = args.contains("--ci");
+        let keep_config = args.contains("--keep-config");
+        let link_stdcpp = !args.contains("--no-stdcpp");
+        let all_targets = args.contains("--all-targets");
 
         let platform: Option<String> = args.opt_value_from_str("--platform").unwrap();
+        let platform = platform.as_deref().map(|platform| match platform {
+            "windows" => BuildPlatform::Windows,
+            "linux" => BuildPlatform::Linux,
+            "macos" => BuildPlatform::Macos,
+            "android" => BuildPlatform::Android,
+            _ => panic!("Unrecognized platform."),
+        });
+
         let version: Option<String> = args.opt_value_from_str("--version").unwrap();
         let root: Option<String> = args.opt_value_from_str("--root").unwrap();
+
+        let package_flavor = if args.contains("--meta-store") {
+            ReleaseFlavor::MetaStore
+        } else if args.contains("--pico-store") {
+            ReleaseFlavor::PicoStore
+        } else {
+            ReleaseFlavor::GitHub
+        };
 
         if args.finish().is_empty() {
             match subcommand.as_str() {
                 "prepare-deps" => {
                     if let Some(platform) = platform {
-                        match platform.as_str() {
-                            "windows" => dependencies::prepare_windows_deps(for_ci),
-                            "linux" => dependencies::build_ffmpeg_linux(!no_nvidia),
-                            "android" => dependencies::build_android_deps(for_ci),
-                            _ => panic!("Unrecognized platform."),
+                        if matches!(platform, BuildPlatform::Android) {
+                            dependencies::build_android_deps(
+                                for_ci,
+                                all_targets,
+                                OpenXRLoadersSelection::All,
+                            );
+                        } else {
+                            dependencies::prepare_server_deps(Some(platform), for_ci, !no_nvidia);
                         }
                     } else {
-                        if cfg!(windows) {
-                            dependencies::prepare_windows_deps(for_ci);
-                        } else if cfg!(target_os = "linux") {
-                            dependencies::build_ffmpeg_linux(!no_nvidia);
-                        }
+                        dependencies::prepare_server_deps(platform, for_ci, !no_nvidia);
 
-                        dependencies::build_android_deps(for_ci);
+                        dependencies::build_android_deps(
+                            for_ci,
+                            all_targets,
+                            OpenXRLoadersSelection::All,
+                        );
                     }
                 }
-                "build-server" => build::build_server(is_release, gpl, None, false, experiments),
-                "build-client" => build::build_quest_client(is_release),
-                "build-client-lib" => build::build_client_lib(is_release),
-                "run-server" => {
+                "build-streamer" => {
+                    build::build_streamer(profile, gpl, None, false, profiling, keep_config)
+                }
+                "build-launcher" => build::build_launcher(profile, false),
+                "build-server-lib" => build::build_server_lib(profile, None, false),
+                "build-client" => build::build_android_client(profile),
+                "build-client-lib" => {
+                    build::build_android_client_core_lib(profile, link_stdcpp, all_targets)
+                }
+                "build-client-xr-lib" => {
+                    build::build_android_client_openxr_lib(profile, link_stdcpp)
+                }
+                "run-streamer" => {
                     if !no_rebuild {
-                        build::build_server(is_release, gpl, None, false, experiments);
+                        build::build_streamer(profile, gpl, None, false, profiling, keep_config);
                     }
-                    run_server();
+                    run_streamer();
                 }
-                "package-server" => packaging::package_server(root, gpl),
-                "package-client" => build::build_quest_client(true),
-                "package-client-lib" => packaging::package_client_lib(),
+                "run-launcher" => {
+                    if !no_rebuild {
+                        build::build_launcher(profile, false);
+                    }
+                    run_launcher();
+                }
+                "package-streamer" => {
+                    packaging::package_streamer(platform, for_ci, !no_nvidia, gpl, root)
+                }
+                "package-launcher" => packaging::package_launcher(),
+                "package-client" => packaging::package_client_openxr(package_flavor, for_ci),
+                "package-client-lib" => packaging::package_client_lib(link_stdcpp, all_targets),
+                "format" => format::format(),
+                "check-format" => format::check_format(),
                 "clean" => clean(),
                 "bump" => version::bump_version(version, is_nightly),
-                "clippy" => clippy(),
+                "clippy" => {
+                    if for_ci {
+                        ci::clippy_ci()
+                    } else {
+                        clippy()
+                    }
+                }
+                "check-msrv" => version::check_msrv(),
                 "kill-oculus" => kill_oculus_processes(),
                 _ => {
                     println!("\nUnrecognized subcommand.");

@@ -1,531 +1,413 @@
-#![allow(non_upper_case_globals, non_snake_case, clippy::missing_safety_doc)]
+#![allow(
+    non_upper_case_globals,
+    non_snake_case,
+    clippy::missing_safety_doc,
+    clippy::unseparated_literal_suffix
+)]
 
+mod c_api;
 mod connection;
-mod connection_utils;
-mod decoder;
 mod logging_backend;
-mod platform;
+mod sockets;
 mod statistics;
 mod storage;
 
 #[cfg(target_os = "android")]
 mod audio;
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+pub mod video_decoder;
 
-use crate::storage::{LOBBY_ROOM_BIN, LOBBY_ROOM_GLTF};
-use alvr_audio::{AudioDevice, AudioDeviceType};
 use alvr_common::{
-    glam::{Quat, UVec2, Vec2, Vec3},
-    once_cell::sync::Lazy,
-    parking_lot::Mutex,
-    prelude::*,
-    RelaxedAtomic, ALVR_VERSION,
+    dbg_client_core, error,
+    glam::{UVec2, Vec2, Vec3},
+    parking_lot::{Mutex, RwLock},
+    warn, ConnectionState, DeviceMotion, LifecycleState, Pose, HAND_LEFT_ID, HAND_RIGHT_ID,
+    HEAD_ID,
 };
-use alvr_events::ButtonValue;
-use alvr_session::AudioDeviceId;
-use alvr_sockets::{
-    BatteryPacket, ClientControlPacket, ClientStatistics, DeviceMotion, Fov, HeadsetInfoPacket,
-    Tracking, ViewsConfig,
+use alvr_packets::{
+    BatteryInfo, ButtonEntry, ClientControlPacket, FaceData, RealTimeConfig,
+    ReservedClientControlPacket, StreamConfig, Tracking, ViewParams, ViewsConfig,
 };
-use decoder::EXTERNAL_DECODER;
-use statistics::StatisticsManager;
+use alvr_session::CodecType;
+use connection::{ConnectionContext, DecoderCallback};
 use std::{
-    collections::VecDeque,
-    ffi::{c_void, CStr},
-    os::raw::c_char,
-    ptr, slice,
-    time::{Duration, Instant},
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 use storage::Config;
-use tokio::{runtime::Runtime, sync::mpsc, sync::Notify};
 
-static STATISTICS_MANAGER: Lazy<Mutex<Option<StatisticsManager>>> = Lazy::new(|| Mutex::new(None));
+pub use logging_backend::init_logging;
 
-static RUNTIME: Lazy<Mutex<Option<Runtime>>> = Lazy::new(|| Mutex::new(None));
-static TRACKING_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<Tracking>>>> =
-    Lazy::new(|| Mutex::new(None));
-static STATISTICS_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ClientStatistics>>>> =
-    Lazy::new(|| Mutex::new(None));
-static CONTROL_CHANNEL_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ClientControlPacket>>>> =
-    Lazy::new(|| Mutex::new(None));
-static DISCONNECT_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
-static ON_DESTROY_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
-
-static PREFERRED_RESOLUTION: Lazy<Mutex<UVec2>> = Lazy::new(|| Mutex::new(UVec2::ZERO));
-
-static EVENT_QUEUE: Lazy<Mutex<VecDeque<AlvrEvent>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
-
-static IS_RESUMED: RelaxedAtomic = RelaxedAtomic::new(false);
-static IS_STREAMING: RelaxedAtomic = RelaxedAtomic::new(false);
-
-static USE_OPENGL: RelaxedAtomic = RelaxedAtomic::new(true);
-
-pub enum AlvrCodec {
-    H264,
-    H265,
-}
-
-#[repr(u8)]
-pub enum AlvrEvent {
-    StreamingStarted {
-        view_width: u32,
-        view_height: u32,
-        fps: f32,
-        oculus_foveation_level: i32,
-        dynamic_oculus_foveation: bool,
-        extra_latency: bool,
-        controller_prediction_multiplier: f32,
-    },
+pub enum ClientCoreEvent {
+    UpdateHudMessage(String),
+    StreamingStarted(Box<StreamConfig>),
     StreamingStopped,
     Haptics {
         device_id: u64,
-        duration_s: f32,
+        duration: Duration,
         frequency: f32,
         amplitude: f32,
     },
-    CreateDecoder {
-        codec: AlvrCodec,
+    // Note: All subsequent DecoderConfig events should be ignored until reconnection
+    DecoderConfig {
+        codec: CodecType,
+        config_nal: Vec<u8>,
     },
-    NalReady,
+    RealTimeConfig(RealTimeConfig),
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct EyeFov {
-    left: f32,
-    right: f32,
-    top: f32,
-    bottom: f32,
+// Note: this struct may change without breaking network protocol changes
+#[derive(Clone)]
+pub struct ClientCapabilities {
+    pub default_view_resolution: UVec2,
+    pub refresh_rates: Vec<f32>,
+    pub foveated_encoding: bool,
+    pub encoder_high_profile: bool,
+    pub encoder_10_bits: bool,
+    pub encoder_av1: bool,
+    pub prefer_10bit: bool,
+    pub prefer_full_range: bool,
+    pub preferred_encoding_gamma: f32,
+    pub prefer_hdr: bool,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct AlvrQuat {
-    x: f32,
-    y: f32,
-    z: f32,
-    w: f32,
+pub struct ClientCoreContext {
+    lifecycle_state: Arc<RwLock<LifecycleState>>,
+    event_queue: Arc<Mutex<VecDeque<ClientCoreEvent>>>,
+    connection_context: Arc<ConnectionContext>,
+    connection_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-#[repr(C)]
-#[derive(Clone, Default)]
-pub struct AlvrDeviceMotion {
-    device_id: u64,
-    orientation: AlvrQuat,
-    position: [f32; 3],
-    linear_velocity: [f32; 3],
-    angular_velocity: [f32; 3],
-}
+impl ClientCoreContext {
+    pub fn new(capabilities: ClientCapabilities) -> Self {
+        dbg_client_core!("Create");
 
-#[repr(C)]
-pub struct AlvrEyeInput {
-    orientation: AlvrQuat,
-    position: [f32; 3],
-    fov: EyeFov,
-}
+        // Make sure to reset config in case of version compat mismatch.
+        if Config::load().protocol_id != alvr_common::protocol_id() {
+            // NB: Config::default() sets the current protocol ID
+            Config::default().store();
+        }
 
-#[repr(C)]
-pub struct OculusHand {
-    enabled: bool,
-    bone_rotations: [AlvrQuat; 19],
-}
-
-#[repr(C)]
-pub enum AlvrButtonValue {
-    Binary(bool),
-    Scalar(f32),
-}
-
-#[repr(C)]
-pub enum AlvrLogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn alvr_path_string_to_hash(path: *const c_char) -> u64 {
-    alvr_common::hash_string(CStr::from_ptr(path).to_str().unwrap())
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_log(level: AlvrLogLevel, message: *const c_char) {
-    let message = unsafe { CStr::from_ptr(message) }.to_str().unwrap();
-    match level {
-        AlvrLogLevel::Error => error!("[ALVR NATIVE] {message}"),
-        AlvrLogLevel::Warn => warn!("[ALVR NATIVE] {message}"),
-        AlvrLogLevel::Info => info!("[ALVR NATIVE] {message}"),
-        AlvrLogLevel::Debug => debug!("[ALVR NATIVE] {message}"),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_log_time(tag: *const c_char) {
-    let tag = unsafe { CStr::from_ptr(tag) }.to_str().unwrap();
-    error!("[ALVR NATIVE] {tag}: {:?}", Instant::now());
-}
-
-/// On non-Android platforms, java_vm and constext should be null.
-/// NB: context must be thread safe.
-#[no_mangle]
-pub extern "C" fn alvr_initialize(
-    java_vm: *mut c_void,
-    context: *mut c_void,
-    recommended_view_width: u32,
-    recommended_view_height: u32,
-    refresh_rates: *const f32,
-    refresh_rates_count: i32,
-    use_opengl: bool,
-    external_decoder: bool,
-) {
-    #[cfg(target_os = "android")]
-    unsafe {
-        ndk_context::initialize_android_context(java_vm, context)
-    };
-
-    logging_backend::init_logging();
-
-    #[cfg(target_os = "android")]
-    unsafe {
-        LOBBY_ROOM_GLTF_PTR = LOBBY_ROOM_GLTF.as_ptr();
-        LOBBY_ROOM_GLTF_LEN = LOBBY_ROOM_GLTF.len() as _;
-        LOBBY_ROOM_BIN_PTR = LOBBY_ROOM_BIN.as_ptr();
-        LOBBY_ROOM_BIN_LEN = LOBBY_ROOM_BIN.len() as _;
-    }
-
-    unsafe {
-        createDecoder = Some(decoder::create_decoder);
-        pushNal = Some(decoder::push_nal);
-    }
-
-    // Make sure to reset config in case of version compat mismatch.
-    if Config::load().protocol_id != alvr_common::protocol_id() {
-        // NB: Config::default() sets the current protocol ID
-        Config::default().store();
-    }
-
-    #[cfg(target_os = "android")]
-    platform::try_get_microphone_permission();
-
-    USE_OPENGL.set(use_opengl);
-    EXTERNAL_DECODER.set(external_decoder);
-
-    #[cfg(target_os = "android")]
-    if use_opengl {
-        unsafe { initGraphicsNative() };
-    }
-
-    *PREFERRED_RESOLUTION.lock() = UVec2::new(recommended_view_width, recommended_view_height);
-
-    let available_refresh_rates =
-        unsafe { slice::from_raw_parts(refresh_rates, refresh_rates_count as _).to_vec() };
-    let preferred_refresh_rate = available_refresh_rates.last().cloned().unwrap_or(60_f32);
-
-    let microphone_sample_rate =
-        AudioDevice::new(None, &AudioDeviceId::Default, AudioDeviceType::Input)
-            .unwrap()
-            .input_sample_rate()
-            .unwrap();
-
-    let headset_info = HeadsetInfoPacket {
-        recommended_eye_width: recommended_view_width as _,
-        recommended_eye_height: recommended_view_height as _,
-        available_refresh_rates,
-        preferred_refresh_rate,
-        microphone_sample_rate,
-        reserved: format!("{}", *ALVR_VERSION),
-    };
-
-    let runtime = Runtime::new().unwrap();
-
-    runtime.spawn(async move {
-        let connection_loop = connection::connection_lifecycle_loop(headset_info);
-
-        tokio::select! {
-            _ = connection_loop => (),
-            _ = ON_DESTROY_NOTIFIER.notified() => ()
-        };
-    });
-
-    *RUNTIME.lock() = Some(runtime);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn alvr_destroy() {
-    ON_DESTROY_NOTIFIER.notify_waiters();
-
-    // shutdown and wait for tasks to finish
-    drop(RUNTIME.lock().take());
-
-    #[cfg(target_os = "android")]
-    if USE_OPENGL.value() {
-        destroyGraphicsNative();
-    }
-}
-
-/// If no OpenGL is selected, arguments are ignored
-#[no_mangle]
-pub unsafe extern "C" fn alvr_resume(swapchain_textures: *mut *const i32, swapchain_length: i32) {
-    #[cfg(target_os = "android")]
-    if USE_OPENGL.value() {
-        let resolution = *PREFERRED_RESOLUTION.lock();
-        prepareLobbyRoom(
-            resolution.x as _,
-            resolution.y as _,
-            swapchain_textures,
-            swapchain_length,
-        );
-    }
-
-    IS_RESUMED.set(true);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn alvr_pause() {
-    IS_RESUMED.set(false);
-
-    #[cfg(target_os = "android")]
-    if USE_OPENGL.value() {
-        destroyRenderers();
-    }
-}
-
-/// Returns true if there was a new event
-#[no_mangle]
-pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
-    if let Some(event) = EVENT_QUEUE.lock().pop_front() {
-        *out_event = event;
-
-        true
-    } else {
-        false
-    }
-}
-
-/// Call only when using OpenGL
-#[cfg(target_os = "android")]
-#[no_mangle]
-pub unsafe extern "C" fn alvr_start_stream(
-    swapchain_textures: *mut *const i32,
-    swapchain_length: i32,
-) {
-    streamStartNative(swapchain_textures, swapchain_length);
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_send_views_config(fov: *const EyeFov, ipd_m: f32) {
-    let fov = unsafe { slice::from_raw_parts(fov, 2) };
-    if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender
-            .send(ClientControlPacket::ViewsConfig(ViewsConfig {
-                fov: [
-                    Fov {
-                        left: fov[0].left,
-                        right: fov[0].right,
-                        top: fov[0].top,
-                        bottom: fov[0].bottom,
-                    },
-                    Fov {
-                        left: fov[1].left,
-                        right: fov[1].right,
-                        top: fov[1].top,
-                        bottom: fov[1].bottom,
-                    },
-                ],
-                ipd_m,
-            }))
-            .ok();
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_send_battery(device_id: u64, gauge_value: f32, is_plugged: bool) {
-    if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender
-            .send(ClientControlPacket::Battery(BatteryPacket {
-                device_id,
-                gauge_value,
-                is_plugged,
-            }))
-            .ok();
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_send_playspace(width: f32, height: f32) {
-    if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender
-            .send(ClientControlPacket::PlayspaceSync(Vec2::new(width, height)))
-            .ok();
-    }
-}
-
-/// Call only when using OpenGL
-#[cfg(target_os = "android")]
-#[no_mangle]
-pub unsafe extern "C" fn alvr_render_lobby(
-    eye_inputs: *const AlvrEyeInput,
-    swapchain_indices: *const i32,
-) {
-    let eye_inputs = [
+        #[cfg(target_os = "android")]
         {
-            let o = (*eye_inputs).orientation;
-            let f = (*eye_inputs).fov;
-            EyeInput {
-                orientation: [o.x, o.y, o.z, o.w],
-                position: (*eye_inputs).position,
-                fovLeft: f.left,
-                fovRight: f.right,
-                fovTop: f.top,
-                fovBottom: f.bottom,
-            }
-        },
-        {
-            let o = (*eye_inputs.offset(1)).orientation;
-            let f = (*eye_inputs.offset(1)).fov;
-            EyeInput {
-                orientation: [o.x, o.y, o.z, o.w],
-                position: (*eye_inputs.offset(1)).position,
-                fovLeft: f.left,
-                fovRight: f.right,
-                fovTop: f.top,
-                fovBottom: f.bottom,
-            }
-        },
-    ];
+            dbg_client_core!("Getting permissions");
+            alvr_system_info::try_get_permission(alvr_system_info::MICROPHONE_PERMISSION);
+            alvr_system_info::set_wifi_lock(true);
+        }
 
-    renderLobbyNative(eye_inputs.as_ptr(), swapchain_indices);
-}
-
-/// Call only when using OpenGL
-
-#[cfg(target_os = "android")]
-#[no_mangle]
-pub unsafe extern "C" fn alvr_render_stream(
-    swapchain_indices: *const i32,
-    hardware_buffer: *mut c_void,
-) {
-    renderStreamNative(swapchain_indices, hardware_buffer);
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_send_button(path_id: u64, value: AlvrButtonValue) {
-    if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender
-            .send(ClientControlPacket::Button {
-                path_id,
-                value: match value {
-                    AlvrButtonValue::Binary(value) => ButtonValue::Binary(value),
-                    AlvrButtonValue::Scalar(value) => ButtonValue::Scalar(value),
-                },
-            })
-            .ok();
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_send_tracking(
-    target_timestamp_ns: u64,
-    device_motions: *const AlvrDeviceMotion,
-    device_motions_count: u64,
-    left_oculus_hand: OculusHand,
-    right_oculus_hand: OculusHand,
-) {
-    fn from_tracking_quat(quat: AlvrQuat) -> Quat {
-        Quat::from_xyzw(quat.x, quat.y, quat.z, quat.w)
-    }
-
-    fn from_oculus_hand(hand: OculusHand) -> Option<[Quat; 19]> {
-        hand.enabled.then(|| {
-            let vec = hand
-                .bone_rotations
-                .iter()
-                .cloned()
-                .map(from_tracking_quat)
-                .collect::<Vec<_>>();
-
-            let mut array = [Quat::IDENTITY; 19];
-            array.copy_from_slice(&vec);
-
-            array
-        })
-    }
-
-    if let Some(sender) = &*TRACKING_SENDER.lock() {
-        let mut raw_motions = vec![AlvrDeviceMotion::default(); device_motions_count as _];
-        unsafe {
-            ptr::copy_nonoverlapping(
-                device_motions,
-                raw_motions.as_mut_ptr(),
-                device_motions_count as _,
-            )
-        };
-
-        let device_motions = raw_motions
-            .into_iter()
-            .map(|motion| {
-                (
-                    motion.device_id,
-                    DeviceMotion {
-                        orientation: from_tracking_quat(motion.orientation),
-                        position: Vec3::from_slice(&motion.position),
-                        linear_velocity: Vec3::from_slice(&motion.linear_velocity),
-                        angular_velocity: Vec3::from_slice(&motion.angular_velocity),
-                    },
+        let lifecycle_state = Arc::new(RwLock::new(LifecycleState::Idle));
+        let event_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let connection_context = Arc::new(ConnectionContext::default());
+        let connection_thread = thread::spawn({
+            let lifecycle_state = Arc::clone(&lifecycle_state);
+            let connection_context = Arc::clone(&connection_context);
+            let event_queue = Arc::clone(&event_queue);
+            move || {
+                connection::connection_lifecycle_loop(
+                    capabilities,
+                    connection_context,
+                    lifecycle_state,
+                    event_queue,
                 )
-            })
-            .collect::<Vec<_>>();
+            }
+        });
 
-        let input = Tracking {
-            target_timestamp: Duration::from_nanos(target_timestamp_ns),
-            device_motions,
-            left_hand_skeleton: from_oculus_hand(left_oculus_hand),
-            right_hand_skeleton: from_oculus_hand(right_oculus_hand),
+        Self {
+            lifecycle_state,
+            event_queue,
+            connection_context,
+            connection_thread: Arc::new(Mutex::new(Some(connection_thread))),
+        }
+    }
+
+    pub fn resume(&self) {
+        dbg_client_core!("resume");
+
+        *self.lifecycle_state.write() = LifecycleState::Resumed;
+    }
+
+    pub fn pause(&self) {
+        dbg_client_core!("pause");
+
+        let mut connection_state_lock = self.connection_context.state.write();
+
+        *self.lifecycle_state.write() = LifecycleState::Idle;
+
+        // We want to shutdown streaming when pausing.
+        if *connection_state_lock != ConnectionState::Disconnected {
+            alvr_common::wait_rwlock(
+                &self.connection_context.disconnected_notif,
+                &mut connection_state_lock,
+            );
+        }
+    }
+
+    pub fn poll_event(&self) -> Option<ClientCoreEvent> {
+        dbg_client_core!("poll_event");
+
+        self.event_queue.lock().pop_front()
+    }
+
+    pub fn send_battery(&self, device_id: u64, gauge_value: f32, is_plugged: bool) {
+        dbg_client_core!("send_battery");
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::Battery(BatteryInfo {
+                    device_id,
+                    gauge_value,
+                    is_plugged,
+                }))
+                .ok();
+        }
+    }
+
+    pub fn send_playspace(&self, area: Option<Vec2>) {
+        dbg_client_core!("send_playspace");
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender.send(&ClientControlPacket::PlayspaceSync(area)).ok();
+        }
+    }
+
+    pub fn send_active_interaction_profile(&self, device_id: u64, profile_id: u64) {
+        dbg_client_core!("send_active_interaction_profile");
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::ActiveInteractionProfile {
+                    device_id,
+                    profile_id,
+                })
+                .ok();
+        }
+    }
+
+    pub fn send_custom_interaction_profile(&self, device_id: u64, input_ids: HashSet<u64>) {
+        dbg_client_core!("send_custom_interaction_profile");
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&alvr_packets::encode_reserved_client_control_packet(
+                    &ReservedClientControlPacket::CustomInteractionProfile {
+                        device_id,
+                        input_ids,
+                    },
+                ))
+                .ok();
+        }
+    }
+
+    pub fn send_buttons(&self, entries: Vec<ButtonEntry>) {
+        dbg_client_core!("send_buttons");
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender.send(&ClientControlPacket::Buttons(entries)).ok();
+        }
+    }
+
+    // These must be in its local space, as if the head pose is in the origin.
+    pub fn send_view_params(&self, views: [ViewParams; 2]) {
+        dbg_client_core!("send_view_params");
+
+        *self.connection_context.view_params.write() = views;
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::ViewsConfig(ViewsConfig {
+                    fov: [views[0].fov, views[1].fov],
+                    ipd_m: (views[0].pose.position - views[1].pose.position).length(),
+                }))
+                .ok();
+        }
+    }
+
+    pub fn send_tracking(
+        &self,
+        poll_timestamp: Duration,
+        mut device_motions: Vec<(u64, DeviceMotion)>,
+        hand_skeletons: [Option<[Pose; 26]>; 2],
+        face_data: FaceData,
+    ) {
+        dbg_client_core!("send_tracking");
+
+        let max_prediction = *self.connection_context.max_prediction.read();
+
+        let target_timestamp = if let Some(stats) =
+            &*self.connection_context.statistics_manager.lock()
+        {
+            poll_timestamp + Duration::min(stats.average_total_pipeline_latency(), max_prediction)
+        } else {
+            poll_timestamp
         };
 
-        sender.send(input).ok();
+        // Guarantee that sent timestamps never go backwards by sending the poll time
+        let reported_timestamp = poll_timestamp;
+
+        for (id, motion) in &mut device_motions {
+            let velocity_multiplier = *self.connection_context.velocities_multiplier.read();
+            motion.linear_velocity *= velocity_multiplier;
+            motion.angular_velocity *= velocity_multiplier;
+
+            if *id == *HEAD_ID {
+                *motion = motion.predict(poll_timestamp, target_timestamp);
+
+                let mut head_pose_queue = self.connection_context.head_pose_queue.write();
+
+                head_pose_queue.push_back((reported_timestamp, motion.pose));
+
+                while head_pose_queue.len() > 1024 {
+                    head_pose_queue.pop_front();
+                }
+
+                // This is done for backward compatibiity for the v20 protocol. Will be removed with the
+                // tracking rewrite protocol extension.
+                motion.linear_velocity = Vec3::ZERO;
+                motion.angular_velocity = Vec3::ZERO;
+            } else if let Some(stats) = &*self.connection_context.statistics_manager.lock() {
+                let tracker_timestamp = poll_timestamp
+                    + Duration::min(stats.tracker_prediction_offset(), max_prediction);
+
+                *motion = motion.predict(poll_timestamp, tracker_timestamp);
+            }
+        }
+
+        // send_tracking() expects hand data in the multimodal protocol. In case multimodal protocol
+        // is not supported, convert back to legacy protocol.
+        if !self.connection_context.uses_multimodal_protocol.value() {
+            if hand_skeletons[0].is_some() {
+                device_motions.push((
+                    *HAND_LEFT_ID,
+                    DeviceMotion {
+                        pose: hand_skeletons[0].unwrap()[0],
+                        linear_velocity: Vec3::ZERO,
+                        angular_velocity: Vec3::ZERO,
+                    },
+                ));
+            }
+
+            if hand_skeletons[1].is_some() {
+                device_motions.push((
+                    *HAND_RIGHT_ID,
+                    DeviceMotion {
+                        pose: hand_skeletons[1].unwrap()[0],
+                        linear_velocity: Vec3::ZERO,
+                        angular_velocity: Vec3::ZERO,
+                    },
+                ));
+            }
+        }
+
+        if let Some(sender) = &mut *self.connection_context.tracking_sender.lock() {
+            sender
+                .send_header(&Tracking {
+                    target_timestamp: reported_timestamp,
+                    device_motions,
+                    hand_skeletons,
+                    face_data,
+                })
+                .ok();
+
+            if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+                stats.report_input_acquired(reported_timestamp);
+            }
+        }
     }
-}
 
-#[no_mangle]
-pub extern "C" fn alvr_get_prediction_offset_ns() -> u64 {
-    if let Some(stats) = &*STATISTICS_MANAGER.lock() {
-        stats.average_total_pipeline_latency().as_nanos() as _
-    } else {
-        0
+    pub fn get_total_prediction_offset(&self) -> Duration {
+        dbg_client_core!("get_total_prediction_offset");
+
+        if let Some(stats) = &*self.connection_context.statistics_manager.lock() {
+            stats.average_total_pipeline_latency()
+        } else {
+            Duration::ZERO
+        }
     }
-}
 
-#[no_mangle]
-pub extern "C" fn alvr_report_submit(target_timestamp_ns: u64, vsync_queue_ns: u64) {
-    if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
-        let timestamp = Duration::from_nanos(target_timestamp_ns);
-        stats.report_submit(timestamp, Duration::from_nanos(vsync_queue_ns));
+    /// The callback should return true if the frame was successfully submitted to the decoder
+    pub fn set_decoder_input_callback(&self, callback: Box<DecoderCallback>) {
+        dbg_client_core!("set_decoder_input_callback");
 
-        if let Some(sender) = &*STATISTICS_SENDER.lock() {
-            if let Some(stats) = stats.summary(timestamp) {
-                sender.send(stats).ok();
-            } else {
-                error!("Statistics summary not ready!");
+        *self.connection_context.decoder_callback.lock() = Some(callback);
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender.send(&ClientControlPacket::RequestIdr).ok();
+        }
+    }
+
+    pub fn report_frame_decoded(&self, timestamp: Duration) {
+        dbg_client_core!("report_frame_decoded");
+
+        if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+            stats.report_frame_decoded(timestamp);
+        }
+    }
+
+    pub fn report_fatal_decoder_error(&self, error: &str) {
+        error!("Fatal decoder error, restarting connection: {error}");
+
+        // The connection loop observes changes on this value
+        *self.connection_context.state.write() = ConnectionState::Disconnecting;
+    }
+
+    pub fn report_compositor_start(&self, timestamp: Duration) -> [ViewParams; 2] {
+        dbg_client_core!("report_compositor_start");
+
+        if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+            stats.report_compositor_start(timestamp);
+        }
+
+        let mut head_pose = *self.connection_context.last_good_head_pose.read();
+        for (ts, pose) in &*self.connection_context.head_pose_queue.read() {
+            if *ts == timestamp {
+                head_pose = *pose;
+                break;
+            }
+        }
+        let view_params = self.connection_context.view_params.read();
+
+        [
+            ViewParams {
+                pose: head_pose * view_params[0].pose,
+                fov: view_params[0].fov,
+            },
+            ViewParams {
+                pose: head_pose * view_params[1].pose,
+                fov: view_params[1].fov,
+            },
+        ]
+    }
+
+    pub fn report_submit(&self, timestamp: Duration, vsync_queue: Duration) {
+        dbg_client_core!("report_submit");
+
+        if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+            stats.report_submit(timestamp, vsync_queue);
+
+            if let Some(sender) = &mut *self.connection_context.statistics_sender.lock() {
+                if let Some(stats) = stats.summary(timestamp) {
+                    sender.send_header(&stats).ok();
+                } else {
+                    warn!("Statistics summary not ready!");
+                }
             }
         }
     }
 }
 
-/// Call only with external decoder
-#[no_mangle]
-pub extern "C" fn alvr_request_idr() {
-    if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender.send(ClientControlPacket::RequestIdr).ok();
-    }
-}
+impl Drop for ClientCoreContext {
+    fn drop(&mut self) {
+        dbg_client_core!("Drop");
 
-/// Call only with external decoder
-#[no_mangle]
-pub extern "C" fn alvr_report_frame_decoded(timestamp_ns: u64) {
-    if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
-        stats.report_frame_decoded(Duration::from_nanos(timestamp_ns as _));
+        *self.lifecycle_state.write() = LifecycleState::ShuttingDown;
+
+        if let Some(thread) = self.connection_thread.lock().take() {
+            thread.join().ok();
+        }
+
+        #[cfg(target_os = "android")]
+        alvr_system_info::set_wifi_lock(false);
     }
 }

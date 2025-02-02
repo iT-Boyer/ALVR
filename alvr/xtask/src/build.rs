@@ -1,38 +1,128 @@
-use crate::{command, dependencies, version};
+use crate::command;
 use alvr_filesystem::{self as afs, Layout};
+use std::{
+    env,
+    fmt::{self, Display, Formatter},
+    fs,
+    path::PathBuf,
+    vec,
+};
 use xshell::{cmd, Shell};
 
-pub fn build_server(
-    is_release: bool,
+#[derive(Clone, Copy)]
+pub enum Profile {
+    Debug,
+    Release,
+    Distribution,
+}
+
+impl Display for Profile {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let string = match self {
+            Profile::Distribution => "distribution",
+            Profile::Release => "release",
+            Profile::Debug => "debug",
+        };
+        write!(f, "{string}")
+    }
+}
+
+pub fn build_server_lib(profile: Profile, root: Option<String>, reproducible: bool) {
+    let sh = Shell::new().unwrap();
+
+    let mut flags = vec![];
+    match profile {
+        Profile::Distribution => {
+            flags.push("--profile");
+            flags.push("distribution");
+        }
+        Profile::Release => flags.push("--release"),
+        Profile::Debug => (),
+    }
+    if reproducible {
+        flags.push("--locked");
+    }
+    let flags_ref = &flags;
+
+    let artifacts_dir = afs::target_dir().join(profile.to_string());
+
+    let build_dir = afs::build_dir().join("alvr_server_core");
+    sh.create_dir(&build_dir).unwrap();
+
+    if let Some(root) = root {
+        sh.set_var("ALVR_ROOT_DIR", root);
+    }
+
+    let _push_guard = sh.push_dir(afs::crate_dir("server_core"));
+    cmd!(sh, "cargo build {flags_ref...}").run().unwrap();
+
+    sh.copy_file(
+        artifacts_dir.join(afs::dynlib_fname("alvr_server_core")),
+        &build_dir,
+    )
+    .unwrap();
+
+    if cfg!(windows) {
+        sh.copy_file(artifacts_dir.join("alvr_server_core.pdb"), &build_dir)
+            .unwrap();
+    }
+
+    let out = build_dir.join("alvr_server_core.h");
+    cmd!(sh, "cbindgen --output {out}").run().unwrap();
+}
+
+pub fn build_streamer(
+    profile: Profile,
     gpl: bool,
     root: Option<String>,
     reproducible: bool,
-    experiments: bool,
+    profiling: bool,
+    keep_config: bool,
 ) {
     let sh = Shell::new().unwrap();
 
-    let build_layout = Layout::new(&afs::server_build_dir());
-
-    let build_type = if is_release { "release" } else { "debug" };
+    let build_layout = Layout::new(&afs::streamer_build_dir());
 
     let mut common_flags = vec![];
-    if is_release {
-        common_flags.push("--release");
+    match profile {
+        Profile::Distribution => {
+            common_flags.push("--profile");
+            common_flags.push("distribution");
+        }
+        Profile::Release => common_flags.push("--release"),
+        Profile::Debug => (),
     }
     if reproducible {
         common_flags.push("--locked");
     }
+
+    let artifacts_dir = if cfg!(all(windows, target_arch = "aarch64")) {
+        // Fix for cross compilation
+        const TARGET: &str = "x86_64-pc-windows-msvc";
+
+        common_flags.push("--target");
+        common_flags.push(TARGET);
+
+        afs::target_dir().join(TARGET).join(profile.to_string())
+    } else {
+        afs::target_dir().join(profile.to_string())
+    };
+
     let common_flags_ref = &common_flags;
 
-    let gpl_flag = gpl.then(|| vec!["--features", "gpl"]).unwrap_or_default();
+    let maybe_config = if keep_config {
+        fs::read_to_string(build_layout.session()).ok()
+    } else {
+        None
+    };
 
-    let artifacts_dir = afs::target_dir().join(build_type);
-
-    sh.remove_path(&afs::server_build_dir()).unwrap();
-    sh.create_dir(&afs::server_build_dir()).unwrap();
-    sh.create_dir(&build_layout.openvr_driver_lib_dir())
-        .unwrap();
+    sh.remove_path(afs::streamer_build_dir()).ok();
+    sh.create_dir(build_layout.openvr_driver_lib_dir()).unwrap();
     sh.create_dir(&build_layout.executables_dir).unwrap();
+
+    if let Some(config) = maybe_config {
+        fs::write(build_layout.session(), config).ok();
+    }
 
     if let Some(root) = root {
         sh.set_var("ALVR_ROOT_DIR", root);
@@ -40,35 +130,60 @@ pub fn build_server(
 
     // build server
     {
-        let _push_guard = sh.push_dir(afs::crate_dir("server"));
-        cmd!(sh, "cargo build {common_flags_ref...} {gpl_flag...}")
-            .run()
-            .unwrap();
+        let gpl_flag = gpl.then(|| vec!["--features", "gpl"]).unwrap_or_default();
+        let profiling_flag = profiling
+            .then(|| vec!["--features", "alvr_server_core/trace-performance"])
+            .unwrap_or_default();
+
+        let _push_guard = sh.push_dir(afs::crate_dir("server_openvr"));
+        cmd!(
+            sh,
+            "cargo build {common_flags_ref...} {gpl_flag...} {profiling_flag...}"
+        )
+        .run()
+        .unwrap();
 
         sh.copy_file(
-            artifacts_dir.join(afs::dynlib_fname("alvr_server")),
+            artifacts_dir.join(afs::dynlib_fname("alvr_server_openvr")),
             build_layout.openvr_driver_lib(),
         )
         .unwrap();
+
+        if cfg!(windows) {
+            sh.copy_file(
+                artifacts_dir.join("alvr_server_openvr.pdb"),
+                build_layout
+                    .openvr_driver_lib_dir()
+                    .join("alvr_server_openvr.pdb"),
+            )
+            .unwrap();
+        }
     }
 
-    // build launcher
+    // Build dashboard
     {
-        let _push_guard = sh.push_dir(afs::crate_dir("launcher"));
+        let _push_guard = sh.push_dir(afs::crate_dir("dashboard"));
         cmd!(sh, "cargo build {common_flags_ref...}").run().unwrap();
 
         sh.copy_file(
-            artifacts_dir.join(afs::exec_fname("alvr_launcher")),
-            build_layout.launcher_exe(),
+            artifacts_dir.join(afs::exec_fname("alvr_dashboard")),
+            build_layout.dashboard_exe(),
         )
         .unwrap();
     }
 
     // copy dependencies
     if cfg!(windows) {
+        sh.copy_file(
+            afs::workspace_dir().join("openvr/bin/win64/openvr_api.dll"),
+            build_layout.openvr_driver_lib_dir(),
+        )
+        .unwrap();
+
+        // Bring along the c++ runtime
         command::copy_recursive(
             &sh,
-            &afs::crate_dir("server").join("cpp/bin/windows"),
+            &afs::crate_dir("server_openvr").join("cpp/bin/windows"),
             &build_layout.openvr_driver_lib_dir(),
         )
         .unwrap();
@@ -76,7 +191,7 @@ pub fn build_server(
         // copy ffmpeg binaries
         if gpl {
             let bin_dir = &build_layout.openvr_driver_lib_dir();
-            sh.create_dir(&bin_dir).unwrap();
+            sh.create_dir(bin_dir).unwrap();
             for lib_path in sh
                 .read_dir(afs::deps_dir().join("windows/ffmpeg/bin"))
                 .unwrap()
@@ -95,6 +210,11 @@ pub fn build_server(
         sh.copy_file(
             artifacts_dir.join("alvr_vrcompositor_wrapper"),
             build_layout.vrcompositor_wrapper(),
+        )
+        .unwrap();
+        sh.copy_file(
+            artifacts_dir.join("alvr_drm_lease_shim.so"),
+            build_layout.drm_lease_shim(),
         )
         .unwrap();
 
@@ -117,150 +237,185 @@ pub fn build_server(
         )
         .unwrap();
 
-        // copy ffmpeg binaries
-        if gpl {
-            let lib_dir = &build_layout.openvr_driver_root_dir;
-            let mut libavcodec_so = std::path::PathBuf::new();
-            sh.create_dir(&lib_dir).unwrap();
-            let _push_guard = sh.push_dir(&lib_dir);
-            for lib_path in sh
-                .read_dir(afs::deps_dir().join("linux/ffmpeg/alvr_build/lib"))
-                .unwrap()
-                .into_iter()
-                .filter(|path| path.file_name().unwrap().to_string_lossy().contains(".so."))
-            {
-                let src_so_file = lib_path.canonicalize().unwrap(); // canonicalize resolves symlinks.
-                sh.copy_file(&src_so_file, ".").unwrap();
-                // Shell::copy_file does not handle symlinks so we must recreate them.
-                if lib_path.is_symlink() {
-                    assert!(lib_dir.join(src_so_file.file_name().unwrap()).exists());
-                    let so_file = std::path::Path::new(src_so_file.file_name().unwrap());
-                    let so_file_symlink = std::path::Path::new(lib_path.file_name().unwrap());
-                    command::make_symlink(&sh, so_file, so_file_symlink).unwrap();
-                }
-                let lib_filename = src_so_file.file_name().unwrap();
-                if lib_filename.to_string_lossy().starts_with("libavcodec.so") {
-                    libavcodec_so = src_so_file;
-                }
-            }
-            // copy ffmpeg shared lib dependencies.
-            for solib in ["libx264.so", "libx265.so"] {
-                let src_libs = dependencies::find_resolved_so_paths(&libavcodec_so, solib);
-                if !src_libs.is_empty() {
-                    let src_lib = src_libs.first().unwrap();
-                    sh.copy_file(&src_lib, ".").unwrap();
-                }
-            }
-        }
+        sh.copy_file(
+            afs::workspace_dir().join("openvr/bin/linux64/libopenvr_api.so"),
+            build_layout.openvr_driver_lib_dir(),
+        )
+        .unwrap();
+
+        let firewall_script = afs::crate_dir("xtask").join("firewall/alvr_fw_config.sh");
+        let firewalld = afs::crate_dir("xtask").join("firewall/alvr-firewalld.xml");
+        let ufw = afs::crate_dir("xtask").join("firewall/ufw-alvr");
+
+        // copy linux specific firewalls
+        sh.copy_file(firewall_script, build_layout.firewall_script())
+            .unwrap();
+        sh.copy_file(firewalld, build_layout.firewalld_config())
+            .unwrap();
+        sh.copy_file(ufw, build_layout.ufw_config()).unwrap();
     }
 
     // copy static resources
     {
-        // copy dashboard
-        command::copy_recursive(
-            &sh,
-            &afs::workspace_dir().join("dashboard"),
-            &build_layout.dashboard_dir(),
-        )
-        .unwrap();
-
-        // copy presets
-        command::copy_recursive(
-            &sh,
-            &afs::crate_dir("xtask").join("resources/presets"),
-            &build_layout.presets_dir(),
-        )
-        .ok();
-
         // copy driver manifest
         sh.copy_file(
             afs::crate_dir("xtask").join("resources/driver.vrdrivermanifest"),
-            &build_layout.openvr_driver_manifest(),
-        )
-        .unwrap();
-    }
-
-    // build experiments
-    if experiments {
-        command::copy_recursive(
-            &sh,
-            &afs::workspace_dir().join("experiments/gui/resources/languages"),
-            &build_layout.static_resources_dir.join("languages"),
-        )
-        .unwrap();
-
-        let _push_guard = sh.push_dir(afs::workspace_dir().join("experiments/launcher"));
-        cmd!(sh, "cargo build {common_flags_ref...}").run().unwrap();
-        sh.copy_file(
-            artifacts_dir.join(afs::exec_fname("launcher")),
-            build_layout
-                .executables_dir
-                .join(afs::exec_fname("experimental_launcher")),
+            build_layout.openvr_driver_manifest(),
         )
         .unwrap();
     }
 }
 
-pub fn build_client_lib(is_release: bool) {
+pub fn build_launcher(profile: Profile, reproducible: bool) {
     let sh = Shell::new().unwrap();
 
-    let build_dir = afs::build_dir().join("alvr_client_core");
+    let mut common_flags = vec![];
+    match profile {
+        Profile::Distribution => {
+            common_flags.push("--profile");
+            common_flags.push("distribution");
+        }
+        Profile::Release => common_flags.push("--release"),
+        Profile::Debug => (),
+    }
+    if reproducible {
+        common_flags.push("--locked");
+    }
+    let common_flags_ref = &common_flags;
+
+    sh.create_dir(afs::launcher_build_dir()).unwrap();
+
+    cmd!(sh, "cargo build -p alvr_launcher {common_flags_ref...}")
+        .run()
+        .unwrap();
+
+    sh.copy_file(
+        afs::target_dir()
+            .join(profile.to_string())
+            .join(afs::exec_fname("alvr_launcher")),
+        afs::launcher_build_exe_path(),
+    )
+    .unwrap();
+}
+
+fn build_android_lib_impl(dir_name: &str, profile: Profile, link_stdcpp: bool, all_targets: bool) {
+    let sh = Shell::new().unwrap();
+
+    let mut ndk_flags = vec!["--no-strip", "-p", "26", "-t", "arm64-v8a"];
+
+    if all_targets {
+        ndk_flags.extend(["-t", "armeabi-v7a", "-t", "x86_64", "-t", "x86"]);
+    }
+
+    let mut rust_flags = vec![];
+    match profile {
+        Profile::Distribution => {
+            rust_flags.push("--profile");
+            rust_flags.push("distribution")
+        }
+        Profile::Release => rust_flags.push("--release"),
+        Profile::Debug => (),
+    }
+    if !link_stdcpp {
+        rust_flags.push("--no-default-features");
+    }
+    let rust_flags_ref = &rust_flags;
+
+    let build_dir = afs::build_dir().join(format!("alvr_{dir_name}"));
     sh.create_dir(&build_dir).unwrap();
 
-    let mut flags = vec![];
-    if is_release {
-        flags.push("--release");
-    }
-    let flags_ref = &flags;
-
-    let _push_guard = sh.push_dir(afs::crate_dir("client_core"));
-
+    let _push_guard = sh.push_dir(afs::crate_dir(dir_name));
     cmd!(
         sh,
-        "cargo ndk -t arm64-v8a -p 26 -o {build_dir} build {flags_ref...}"
+        "cargo ndk {ndk_flags...} -o {build_dir} build {rust_flags_ref...}"
     )
     .run()
     .unwrap();
 
-    let out = build_dir.join("alvr_client_core.h");
+    let out = build_dir.join(format!("alvr_{dir_name}.h"));
     cmd!(sh, "cbindgen --output {out}").run().unwrap();
 }
 
-pub fn build_quest_client(is_release: bool) {
+pub fn build_android_client_core_lib(profile: Profile, link_stdcpp: bool, all_targets: bool) {
+    build_android_lib_impl("client_core", profile, link_stdcpp, all_targets)
+}
+
+pub fn build_android_client_openxr_lib(profile: Profile, link_stdcpp: bool) {
+    build_android_lib_impl("client_openxr", profile, link_stdcpp, false)
+}
+
+pub fn build_android_client(profile: Profile) {
     let sh = Shell::new().unwrap();
 
-    build_client_lib(is_release);
+    let mut flags = vec![];
+    match profile {
+        Profile::Distribution => {
+            flags.push("--profile");
+            flags.push("distribution")
+        }
+        Profile::Release => flags.push("--release"),
+        Profile::Debug => (),
+    }
+    let flags_ref = &flags;
 
-    let is_nightly = version::version().contains("nightly");
-    let is_release = if is_nightly { false } else { is_release };
+    const ARTIFACT_NAME: &str = "alvr_client_android";
 
-    let package_type = if is_nightly { "Nightly" } else { "Stable" };
-    let build_type = if is_release { "release" } else { "debug" };
+    let target_dir = afs::target_dir();
+    let build_dir = afs::build_dir().join(ARTIFACT_NAME);
+    sh.create_dir(&build_dir).unwrap();
 
-    let build_task = format!("assemble{package_type}{build_type}");
+    // Create debug keystore (signing will be overwritten by CI)
+    if env::var(format!(
+        "CARGO_APK_{}_KEYSTORE",
+        profile.to_string().to_uppercase()
+    ))
+    .is_err()
+        && matches!(profile, Profile::Release | Profile::Distribution)
+    {
+        let keystore_path = build_dir.join("debug.keystore");
+        if !keystore_path.exists() {
+            let keytool = PathBuf::from(env::var("JAVA_HOME").expect("Env var JAVA_HOME not set"))
+                .join("bin")
+                .join(afs::exec_fname("keytool"));
+            let pass = "alvrclient";
 
-    let client_dir = afs::workspace_dir().join("android");
+            let other = vec![
+                "-genkey",
+                "-v",
+                "-alias",
+                "androiddebugkey",
+                "-dname",
+                "CN=Android Debug,O=Android,C=US",
+                "-keyalg",
+                "RSA",
+                "-keysize",
+                "2048",
+                "-validity",
+                "10000",
+            ];
 
-    const ARTIFACT_NAME: &str = "alvr_client_oculus_quest";
+            cmd!(
+                sh,
+                "{keytool} -keystore {keystore_path} -storepass {pass} -keypass {pass} {other...}"
+            )
+            .run()
+            .unwrap();
+        }
+    }
 
-    let _push_guard = sh.push_dir(&client_dir);
-    if cfg!(windows) {
-        cmd!(sh, "cmd /C gradlew.bat {build_task}").run().unwrap();
-    } else {
-        cmd!(sh, "bash ./gradlew {build_task}").run().unwrap();
-    };
+    let _push_guard = sh.push_dir(afs::crate_dir("client_openxr"));
+    cmd!(
+        sh,
+        "cargo apk build --target-dir={target_dir} {flags_ref...}"
+    )
+    .run()
+    .unwrap();
 
-    sh.create_dir(&afs::build_dir().join(ARTIFACT_NAME))
-        .unwrap();
     sh.copy_file(
-        client_dir
-            .join("app/build/outputs/apk")
-            .join(package_type)
-            .join(build_type)
-            .join(format!("app-{package_type}-{build_type}.apk")),
-        afs::build_dir()
-            .join(ARTIFACT_NAME)
-            .join(format!("{ARTIFACT_NAME}.apk")),
+        afs::target_dir()
+            .join(profile.to_string())
+            .join("apk/alvr_client_openxr.apk"),
+        build_dir.join(format!("{ARTIFACT_NAME}.apk")),
     )
     .unwrap();
 }

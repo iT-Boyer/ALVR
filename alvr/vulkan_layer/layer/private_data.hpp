@@ -50,6 +50,8 @@ namespace layer {
     REQUIRED(GetInstanceProcAddr)                                                                  \
     REQUIRED(DestroyInstance)                                                                      \
     REQUIRED(GetPhysicalDeviceProperties)                                                          \
+    REQUIRED(GetPhysicalDeviceProperties2)                                                          \
+    REQUIRED(GetPhysicalDeviceMemoryProperties)                                                    \
     REQUIRED(GetPhysicalDeviceImageFormatProperties)                                               \
     REQUIRED(EnumerateDeviceExtensionProperties)                                                   \
     OPTIONAL(GetPhysicalDeviceSurfaceCapabilitiesKHR)                                              \
@@ -186,9 +188,6 @@ class instance_private_data {
     static void destroy(VkInstance inst);
 
     const instance_dispatch_table disp;
-
-    uint32_t first_plane_index;
-    static const int num_planes = 1;
 
   private:
     /**

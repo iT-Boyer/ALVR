@@ -1,4 +1,5 @@
-use alvr_sockets::ClientStatistics;
+use alvr_common::SlidingWindowAverage;
+use alvr_packets::ClientStatistics;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -7,23 +8,34 @@ use std::{
 struct HistoryFrame {
     input_acquired: Instant,
     video_packet_received: Instant,
-    intervals: ClientStatistics,
+    client_stats: ClientStatistics,
 }
 
 pub struct StatisticsManager {
     history_buffer: VecDeque<HistoryFrame>,
     max_history_size: usize,
     prev_vsync: Instant,
-    last_average_total_pipeline_latency: Duration,
+    total_pipeline_latency_average: SlidingWindowAverage<Duration>,
+    steamvr_pipeline_latency: Duration,
 }
 
 impl StatisticsManager {
-    pub fn new(history_size: usize) -> Self {
+    pub fn new(
+        max_history_size: usize,
+        nominal_server_frame_interval: Duration,
+        steamvr_pipeline_frames: f32,
+    ) -> Self {
         Self {
-            max_history_size: history_size,
+            max_history_size,
             history_buffer: VecDeque::new(),
             prev_vsync: Instant::now(),
-            last_average_total_pipeline_latency: Duration::ZERO,
+            total_pipeline_latency_average: SlidingWindowAverage::new(
+                Duration::ZERO,
+                max_history_size,
+            ),
+            steamvr_pipeline_latency: Duration::from_secs_f32(
+                steamvr_pipeline_frames * nominal_server_frame_interval.as_secs_f32(),
+            ),
         }
     }
 
@@ -31,13 +43,13 @@ impl StatisticsManager {
         if !self
             .history_buffer
             .iter()
-            .any(|frame| frame.intervals.target_timestamp == target_timestamp)
+            .any(|frame| frame.client_stats.target_timestamp == target_timestamp)
         {
             self.history_buffer.push_front(HistoryFrame {
                 input_acquired: Instant::now(),
                 // this is just a placeholder because Instant does not have a default value
                 video_packet_received: Instant::now(),
-                intervals: ClientStatistics {
+                client_stats: ClientStatistics {
                     target_timestamp,
                     ..Default::default()
                 },
@@ -53,7 +65,7 @@ impl StatisticsManager {
         if let Some(frame) = self
             .history_buffer
             .iter_mut()
-            .find(|frame| frame.intervals.target_timestamp == target_timestamp)
+            .find(|frame| frame.client_stats.target_timestamp == target_timestamp)
         {
             frame.video_packet_received = Instant::now();
         }
@@ -63,10 +75,22 @@ impl StatisticsManager {
         if let Some(frame) = self
             .history_buffer
             .iter_mut()
-            .find(|frame| frame.intervals.target_timestamp == target_timestamp)
+            .find(|frame| frame.client_stats.target_timestamp == target_timestamp)
         {
-            frame.intervals.video_decode =
+            frame.client_stats.video_decode =
                 Instant::now().saturating_duration_since(frame.video_packet_received);
+        }
+    }
+
+    pub fn report_compositor_start(&mut self, target_timestamp: Duration) {
+        if let Some(frame) = self
+            .history_buffer
+            .iter_mut()
+            .find(|frame| frame.client_stats.target_timestamp == target_timestamp)
+        {
+            frame.client_stats.video_decoder_queue = Instant::now().saturating_duration_since(
+                frame.video_packet_received + frame.client_stats.video_decode,
+            );
         }
     }
 
@@ -78,53 +102,41 @@ impl StatisticsManager {
         if let Some(frame) = self
             .history_buffer
             .iter_mut()
-            .find(|frame| frame.intervals.target_timestamp == target_timestamp)
+            .find(|frame| frame.client_stats.target_timestamp == target_timestamp)
         {
-            frame.intervals.rendering = now.saturating_duration_since(
-                frame.video_packet_received + frame.intervals.video_decode,
+            frame.client_stats.rendering = now.saturating_duration_since(
+                frame.video_packet_received
+                    + frame.client_stats.video_decode
+                    + frame.client_stats.video_decoder_queue,
             );
-            frame.intervals.vsync_queue = vsync_queue;
-            frame.intervals.total_pipeline_latency =
+            frame.client_stats.vsync_queue = vsync_queue;
+            frame.client_stats.total_pipeline_latency =
                 now.saturating_duration_since(frame.input_acquired) + vsync_queue;
+            self.total_pipeline_latency_average
+                .submit_sample(frame.client_stats.total_pipeline_latency);
 
             let vsync = now + vsync_queue;
-            frame.intervals.frame_interval = vsync.saturating_duration_since(self.prev_vsync);
+            frame.client_stats.frame_interval = vsync.saturating_duration_since(self.prev_vsync);
             self.prev_vsync = vsync;
-        }
-
-        let mut frames_count = 0;
-        let mut sum = Duration::ZERO;
-        for frame in &self.history_buffer {
-            if frame.intervals.total_pipeline_latency != Duration::ZERO {
-                sum += frame.intervals.total_pipeline_latency;
-                frames_count += 1;
-            }
-        }
-        self.last_average_total_pipeline_latency = if frames_count > 0 {
-            sum / frames_count
-        } else {
-            Duration::ZERO
-        };
-
-        if let Some(frame) = self
-            .history_buffer
-            .iter_mut()
-            .find(|frame| frame.intervals.target_timestamp == target_timestamp)
-        {
-            frame.intervals.average_total_pipeline_latency =
-                self.last_average_total_pipeline_latency;
         }
     }
 
     pub fn summary(&self, target_timestamp: Duration) -> Option<ClientStatistics> {
         self.history_buffer
             .iter()
-            .find(|frame| frame.intervals.target_timestamp == target_timestamp)
-            .map(|frame| frame.intervals.clone())
+            .find(|frame| frame.client_stats.target_timestamp == target_timestamp)
+            .map(|frame| frame.client_stats.clone())
     }
 
-    // latency used for prediction
+    // latency used for head prediction
     pub fn average_total_pipeline_latency(&self) -> Duration {
-        self.last_average_total_pipeline_latency
+        self.total_pipeline_latency_average.get_average()
+    }
+
+    // latency used for controllers/trackers prediction
+    pub fn tracker_prediction_offset(&self) -> Duration {
+        self.total_pipeline_latency_average
+            .get_average()
+            .saturating_sub(self.steamvr_pipeline_latency)
     }
 }

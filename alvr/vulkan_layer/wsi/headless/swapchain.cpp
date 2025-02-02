@@ -85,17 +85,24 @@ VkResult swapchain::create_image(const VkImageCreateInfo &image_create,
 
     /* Find a memory type */
     size_t mem_type_idx = 0;
-    for (; mem_type_idx < 8 * sizeof(memory_requirements.memoryTypeBits); ++mem_type_idx) {
-        if (memory_requirements.memoryTypeBits & (1u << mem_type_idx)) {
+    VkMemoryPropertyFlags memFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    VkPhysicalDeviceMemoryProperties prop;
+    m_device_data.instance_data.disp.GetPhysicalDeviceMemoryProperties(m_device_data.physical_device, &prop);
+    for (; mem_type_idx < prop.memoryTypeCount; ++mem_type_idx) {
+        if ((prop.memoryTypes[mem_type_idx].propertyFlags & memFlags) == memFlags && memory_requirements.memoryTypeBits & (1 << mem_type_idx)) {
             break;
         }
     }
+    assert(mem_type_idx < prop.memoryTypeCount);
 
-    assert(mem_type_idx <= 8 * sizeof(memory_requirements.memoryTypeBits) - 1);
+    VkExportMemoryAllocateInfo export_info = {};
+    export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
     VkMemoryDedicatedAllocateInfo ded_info = {};
     ded_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
     ded_info.image = image.image;
+    ded_info.pNext = &export_info;
 
     VkMemoryAllocateInfo mem_info = {};
     mem_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -157,9 +164,14 @@ VkResult swapchain::create_image(const VkImageCreateInfo &image_create,
     exp_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
     exp_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
 
+    VkSemaphoreTypeCreateInfo tim_info = {};
+    tim_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    tim_info.pNext = &exp_info;
+    tim_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+
     VkSemaphoreCreateInfo sem_info = {};
     sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    sem_info.pNext = &exp_info;
+    sem_info.pNext = &tim_info;
 
     res = m_device_data.disp.CreateSemaphore(m_device, &sem_info, nullptr, &image.semaphore);
     if (res != VK_SUCCESS) {
@@ -167,12 +179,6 @@ VkResult swapchain::create_image(const VkImageCreateInfo &image_create,
         destroy_image(image);
         return res;
     }
-
-    VkSubmitInfo submit = {};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &image.semaphore;
-    m_device_data.disp.QueueSubmit(m_queue, 1, &submit, VK_NULL_HANDLE);
 
     VkSemaphoreGetFdInfoKHR sem_fd_info = {};
     sem_fd_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
@@ -245,7 +251,7 @@ bool swapchain::try_connect() {
 
     int ret;
     if (m_socket == -1) {
-        m_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+        m_socket = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (m_socket == -1) {
             perror("socket");
             exit(1);
@@ -262,16 +268,21 @@ bool swapchain::try_connect() {
         return false; // we will try again next frame
     }
 
-    VkPhysicalDeviceProperties prop;
-    m_device_data.instance_data.disp.GetPhysicalDeviceProperties(m_device_data.physical_device,
-                                                                 &prop);
+    VkPhysicalDeviceVulkan11Properties props11 = {};
+    props11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
+
+    VkPhysicalDeviceProperties2 props = {};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props.pNext = &props11;
+    m_device_data.instance_data.disp.GetPhysicalDeviceProperties2(m_device_data.physical_device,
+                                                                  &props);
 
     init_packet init{.num_images = uint32_t(m_swapchain_images.size()),
-      .device_name = {},
+      .device_uuid = {},
       .image_create_info = m_create_info,
       .mem_index = m_mem_index,
       .source_pid = getpid()};
-    memcpy(init.device_name.data(), prop.deviceName, sizeof(prop.deviceName));
+    memcpy(init.device_uuid.data(), props11.deviceUUID, VK_UUID_SIZE);
     ret = write(m_socket, &init, sizeof(init));
     if (ret == -1) {
         perror("write");
@@ -288,12 +299,8 @@ bool swapchain::try_connect() {
     return true;
 }
 
-void swapchain::present_image(uint32_t pending_index) {
+void swapchain::submit_image(uint32_t pending_index) {
     const auto & pose = m_swapchain_images[pending_index].pose.mDeviceToAbsoluteTracking.m;
-
-    if (in_flight_index != UINT32_MAX)
-        unpresent_image(in_flight_index);
-    in_flight_index = pending_index;
     if (!m_connected) {
         m_connected = try_connect();
     }
@@ -302,12 +309,19 @@ void swapchain::present_image(uint32_t pending_index) {
         present_packet packet;
         packet.image = pending_index;
         packet.frame = m_display.m_vsync_count;
+        packet.semaphore_value = m_swapchain_images[pending_index].semaphore_value;
         memcpy(&packet.pose, pose, sizeof(packet.pose));
         ret = write(m_socket, &packet, sizeof(packet));
         if (ret == -1) {
             //FIXME: try to reconnect?
         }
     }
+}
+
+void swapchain::present_image(uint32_t pending_index) {
+    if (in_flight_index != UINT32_MAX)
+        unpresent_image(in_flight_index);
+    in_flight_index = pending_index;
 }
 
 void swapchain::destroy_image(wsi::swapchain_image &image) {
